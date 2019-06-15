@@ -1,0 +1,4 @@
+<?jelly escape-by-default='true'?>
+<div>
+    This plugin deploy callback compile result to Kirin Devops System.
+</div>

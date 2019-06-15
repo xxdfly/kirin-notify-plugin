@@ -1,0 +1,25 @@
+<?jelly escape-by-default='true'?>
+<j:jelly xmlns:j="jelly:core"  xmlns:c="/lib/credentials" xmlns:f="/lib/form">
+    <!--
+      This jelly script is used for per-project configuration.
+
+      See global.jelly for a general discussion about jelly script.
+    -->
+
+    <f:entry title="jenkins URL" field="jenkinsURL">
+        <f:textbox default="${descriptor.getDefaultURL()}" />
+    </f:entry>
+
+    <f:entry title="Callback URL" field="callbackUrl">
+        <f:textbox  />
+    </f:entry>
+
+    <f:entry title="ProjectAppID" field="projectAppId">
+        <f:textbox  />
+    </f:entry>
+
+    <f:entry title="System Credential" field="credentialsId">
+        <c:select />
+    </f:entry>
+
+</j:jelly>

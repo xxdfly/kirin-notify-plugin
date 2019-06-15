@@ -1,0 +1,233 @@
+# -*- coding: utf-8 -*-
+'''
+    the message queue method
+'''
+
+import hashlib
+import os
+import time
+import urlparse
+import requests
+
+from qcloud_cos import CosConfig
+from qcloud_cos import CosS3Client
+import sys
+import logging
+
+from application.settings import (package_server, build_callback_url,
+                                  package_callback_url)
+from application.controllers.loggers import queue_logger
+from application.controllers.commons.utils import get_md5
+from application.models.mysql import insert_into_package
+
+BUILD_CALLBACK_URL = build_callback_url
+PACKAGE_CALLBACK_URL = package_callback_url
+
+PACKAGE_SERVER = package_server
+
+
+def buildnumber_callback(qi, random_id):
+    result = qi.block_until_building(delay=2)
+    if result:
+        job_name = qi.get_job_name()
+        build_number = 1
+        data = {
+            'id': random_id,
+            'job': job_name,
+            'number': build_number,
+            'status': 1,
+            'msg': '正在编译中',
+            'token': hashlib.sha1('zhiqiang.wuWuzq_1016').hexdigest()
+        }
+        response = requests.post(BUILD_CALLBACK_URL, json=data)
+        queue_logger.info(BUILD_CALLBACK_URL)
+        queue_logger.info('bulidnumber_callback: {0}'.format(data))
+        queue_logger.info(response.status_code)
+        return True
+    else:
+        data = {'msg': 'failure'}
+        queue_logger.info('bulidnumber_callback: {0}'.format(data))
+        return False
+
+
+def buildresult_callback(qi, random_id):
+    qi.block_until_complete(delay=2)
+    build = qi.get_build()
+    if build:
+        job_status = build.get_status()
+        job_name = qi.get_job_name()
+        build_number = qi.get_build_number()
+        status = 2 if job_status == 'SUCCESS' else 0
+        data = {
+            'id': random_id,
+            'job': job_name,
+            'number': build_number,
+            'status': status,
+            'msg': job_status,
+            'token': hashlib.sha1('zhiqiang.wuWuzq_1016').hexdigest()
+        }
+        requests.post(BUILD_CALLBACK_URL, json=data)
+        queue_logger.info('bulidresult_callback: {0}'.format(data))
+        return True
+    else:
+        data = {'msg': 'failure'}
+        queue_logger.info('bulidresult_callback: {0}'.format(data))
+        return False
+
+
+def package_callback(random_id, local_file, package_env):
+    """ for prod and pre env the package need to push to
+        the online package server by http
+    :params: local_file ('local package filename'')
+    """
+    package_time = time.strftime('%Y%m%d')
+
+    # package_env 参数类型有'test', 'binjiang_pre', 'xiasha_prod'等
+    package_env_dir = package_env.split('_')
+    cloud_package_env_dir = package_env.split('_')
+    if len(package_env_dir) < 2:
+        package_env_dir.insert(0, 'default')
+    if len(cloud_package_env_dir) < 2:
+        cloud_package_env_dir.insert(0, 'default')
+
+    package_name = os.path.split(local_file)[-1]
+    package_env_dir.insert(0, PACKAGE_SERVER.get(package_env_dir[-1]))
+    package_env_dir.append(package_time)
+    package_env_dir.append(package_name)
+    cloud_package_env_dir.insert(0, '/beibei/deploy/packages')
+    cloud_package_env_dir.append(package_time)
+    cloud_package_env_dir.append(package_name)
+    remote_package_server = '/'.join(package_env_dir)
+
+    logging.basicConfig(level=logging.WARN, stream=sys.stdout)
+    secret_id = 'AKIDgAPPDsoGvLWSCkECC1ShhS1MSjnlq5Vl'
+    secret_key = 'IMwKYZOyPdjcR9lFgspW3LVbXIo6C2bx'  #
+    region = 'ap-shanghai'  #
+    token = None  #
+    scheme = 'https'  #
+    config = CosConfig(Region=region, SecretId=secret_id, SecretKey=secret_key, Token=token, Scheme=scheme)
+    client = CosS3Client(config)
+    bucket_name = "wukong-1257667045"
+
+    file_name = '/'.join(cloud_package_env_dir)
+    local_file_path = local_file
+    queue_logger.info(
+        'cloud_file_name: {0}-{1}'.format(file_name, local_file))
+
+    # 分块上传接口(推荐，速度最快）
+    response = client.upload_file(
+        Bucket=bucket_name,
+        LocalFilePath=local_file_path,
+        Key=file_name,  # 服务端保存的名称
+        PartSize=10,  # 分块大小设置
+        MAXThread=10,  # 最大并发线程
+        EnableMD5=False
+    )
+
+    if response.get('Location') != None and len(response.get('Location')) > 0:
+        package_url_db = response.get('Location')
+    else:
+        cos_url = client.get_presigned_download_url(Bucket=bucket_name, Key=file_name, Expired=30000)
+        url_obj = urlparse.urlparse(cos_url)
+        package_url_db = url_obj.netloc + url_obj.path
+    # queue_logger.info(
+    #     'http package server: {0}-{1}'.format(r.status_code, r.text))
+
+    # status, package_url = (
+    #     'SUCCESS', remote_package_server) if r.status_code == 200 else (
+    #     'FAILURE', "")
+    status = 'FAILURE'
+    package_url = file_name
+    queue_logger.info(
+        'response Location: {0}'.format(package_url_db))
+    if len(package_url_db) > 0:
+        package_url = package_url_db
+        status = 'SUCCESS'
+
+        insert_id = insert_into_package(product_id=0, package_url=package_url_db,
+                                        md5=get_md5(local_file))
+        queue_logger.info(
+            'insert_id: {0}'.format(insert_id))
+    queue_logger.info(
+        'insert_into_package done')
+
+    data = {
+        'id': random_id,
+        'status': status,
+        'url': package_url,
+        'env': package_env,
+        'token': hashlib.sha1('zhiqiang.wuWuzq_1016').hexdigest()
+    }
+    requests.post(PACKAGE_CALLBACK_URL, json=data)
+    queue_logger.info('package_callback: {0}'.format(data))
+    return True
+
+
+def package_callback_no_callback(random_id, local_file, package_env):
+    """ for binjiang_prod env the package need to push to
+        the online package server by http without callback to wukong
+    :params: local_file ('local package filename'')
+    """
+    package_time = time.strftime('%Y%m%d')
+
+    # package_env 参数类型有'test', 'binjiang_pre', 'xiasha_prod'等
+    package_env_dir = package_env.split('_')
+    if len(package_env_dir) < 2:
+        package_env_dir.insert(0, 'default')
+
+    package_name = os.path.split(local_file)[-1]
+    # package_env_dir.insert(0, PACKAGE_SERVER.get(package_env_dir[-1]))
+    package_env_dir.insert(0, '/beibei/deploy/packages')
+    package_env_dir.append(package_time)
+    package_env_dir.append(package_name)
+    remote_package_server = '/'.join(package_env_dir)
+
+    # r = requests.post(remote_package_server,
+    #                   files={'file': open(local_file, 'rb')})
+    # queue_logger.info(
+    #     'http package server: {0}-{1}'.format(r.status_code, r.text))
+    #
+    # if r.status_code == 200:
+    #     insert_into_package(product_id=0, package_url=remote_package_server,
+    #                         md5=get_md5(local_file))
+
+    logging.basicConfig(level=logging.WARN, stream=sys.stdout)
+    secret_id = 'AKIDgAPPDsoGvLWSCkECC1ShhS1MSjnlq5Vl'
+    secret_key = 'IMwKYZOyPdjcR9lFgspW3LVbXIo6C2bx'  #
+    region = 'ap-shanghai'  #
+    token = None  #
+    scheme = 'https'  #
+    config = CosConfig(Region=region, SecretId=secret_id, SecretKey=secret_key, Token=token, Scheme=scheme)
+    client = CosS3Client(config)
+    bucket_name = "wukong-1257667045"
+
+    file_name = remote_package_server
+    local_file_path = local_file
+    queue_logger.info(
+        'cloud_file_name: {0}-{1}'.format(file_name, local_file))
+
+    # 分块上传接口(推荐，速度最快）
+    response = client.upload_file(
+        Bucket=bucket_name,
+        LocalFilePath=local_file_path,
+        Key=file_name,  # 服务端保存的名称
+        PartSize=10,  # 分块大小设置
+        MAXThread=10,  # 最大并发线程
+        EnableMD5=False
+    )
+
+    queue_logger.info(
+        'response Location: {0}'.format(response.get('Location')))
+    if response.get('Location') != None and len(response.get('Location')) > 0:
+        package_url_db = response.get('Location')
+    else:
+        cos_url = client.get_presigned_download_url(Bucket=bucket_name, Key=file_name, Expired=30000)
+        url_obj = urlparse.urlparse(cos_url)
+        package_url_db = url_obj.netloc + url_obj.path
+
+    insert_into_package(product_id=0, package_url=package_url_db,
+                        md5=get_md5(local_file))
+    queue_logger.info(
+        'insert_into_package done')
+
+    return True
